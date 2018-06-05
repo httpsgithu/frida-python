@@ -110,6 +110,7 @@ class ConsoleApplication(object):
             self._device_type = None
             self._host = None
         self._device = None
+        self._schedule_on_delivered = lambda child: self._reactor.schedule(lambda: self._on_delivered(child))
         self._schedule_on_output = lambda pid, fd, data: self._reactor.schedule(lambda: self._on_output(pid, fd, data))
         self._schedule_on_device_lost = lambda: self._reactor.schedule(self._on_device_lost)
         self._spawned_pid = None
@@ -168,10 +169,7 @@ class ConsoleApplication(object):
         if self._started:
             self._stop()
 
-        if self._session is not None:
-            self._session.off('detached', self._schedule_on_session_detached)
-            self._session.detach()
-            self._session = None
+        self._close_session()
 
         if self._spawned_pid is not None:
             try:
@@ -213,6 +211,9 @@ class ConsoleApplication(object):
             self._device.resume(self._spawned_pid)
         self._resumed = True
 
+    def _wants_child(self, child):
+        return False
+
     def _exit(self, exit_status):
         self._exit_status = exit_status
         self._reactor.stop()
@@ -235,6 +236,7 @@ class ConsoleApplication(object):
             self._device = frida.get_device_manager().add_remote_device(self._host)
         else:
             self._device = frida.get_local_device()
+        self._device.on('delivered', self._schedule_on_delivered)
         self._device.on('output', self._schedule_on_output)
         self._device.on('lost', self._schedule_on_device_lost)
         if self._target is not None:
@@ -253,13 +255,7 @@ class ConsoleApplication(object):
                     if not self._quiet:
                         self._update_status("Attaching...")
                 spawning = False
-                self._session = self._device.attach(attach_target)
-                if self._enable_jit:
-                    self._session.enable_jit()
-                if self._enable_debugger:
-                    self._session.enable_debugger()
-                    self._print("Debugger listening on port 5858\n")
-                self._session.on('detached', self._schedule_on_session_detached)
+                self._open_session(attach_target)
             except Exception as e:
                 if spawning:
                     self._update_status("Failed to spawn: %s" % e)
@@ -270,9 +266,41 @@ class ConsoleApplication(object):
         self._start()
         self._started = True
 
+    def _open_session(self, target):
+        self._session = self._device.attach(target)
+        self._session.enable_child_gating()
+        if self._enable_jit:
+            self._session.enable_jit()
+        if self._enable_debugger:
+            self._session.enable_debugger()
+            self._print("Debugger listening on port 5858\n")
+        self._session.on('detached', self._schedule_on_session_detached)
+
+    def _close_session(self):
+        if self._session is not None:
+            self._session.off('detached', self._schedule_on_session_detached)
+            self._session.detach()
+            self._session = None
+
     def _show_message_if_no_device(self):
         if self._device is None:
             self._print("Waiting for USB device to appear...")
+
+    def _on_delivered(self, child):
+        if not self._wants_child(child):
+            child_summary = "{}(pid={}, path=\"{}\", argv={})".format(child.origin, child.pid, child.path, child.argv)
+
+            if self._session is not None:
+                self._print(Style.BRIGHT + "Ignoring {}".format(child_summary) + Style.RESET_ALL)
+                self._device.resume(child.pid)
+            else:
+                self._print(Style.BRIGHT + "Following {}".format(child_summary) + Style.RESET_ALL)
+                self._spawned_pid = child.pid
+
+                self._open_session(child.pid)
+
+                self._start()
+                self._started = True
 
     def _on_output(self, pid, fd, data):
         if data is None:
@@ -297,9 +325,18 @@ class ConsoleApplication(object):
         self._exit(1)
 
     def _on_session_detached(self, reason):
-        message = reason[0].upper() + reason[1:].replace("-", " ")
-        self._print(Fore.RED + Style.BRIGHT + message + Style.RESET_ALL)
-        self._exit(1)
+        if reason == 'process-replaced':
+            self._resumed = False
+            self._spawned_pid = None
+
+            self._stop()
+            self._started = False
+
+            self._close_session()
+        else:
+            message = reason[0].upper() + reason[1:].replace("-", " ")
+            self._print(Fore.RED + Style.BRIGHT + message + Style.RESET_ALL)
+            self._exit(1)
 
     def _clear_status(self):
         if self._console_state == ConsoleState.STATUS:
